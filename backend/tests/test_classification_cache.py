@@ -50,3 +50,28 @@ class TestClassificationCache(unittest.TestCase):
         cache.clear()
         self.assertEqual(cache.size, 0)
         self.assertIsNone(cache.get("x"))
+
+    def test_thinking_propagated_on_cache_hit(self) -> None:
+        """A cache hit must preserve the original thinking field (not drop it)."""
+        cache = ClassificationCache(max_size=10, ttl_seconds=60)
+        original = ClassificationResult(
+            intent=IntentType.RAG,
+            confidence=0.88,
+            thinking="Step 1: user asked about docs. Step 2: RAG is best.",
+            reasoning="document query",
+        )
+        cache.put("belgede ne var", original)
+        hit = cache.get("belgede ne var")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.classifier_layer, "cache")
+        self.assertEqual(hit.thinking, original.thinking)
+        self.assertEqual(hit.reasoning, original.reasoning)
+
+    def test_thinking_none_propagated(self) -> None:
+        """A cache hit with no thinking field returns thinking=None, not an error."""
+        cache = ClassificationCache(max_size=10, ttl_seconds=60)
+        original = ClassificationResult(intent=IntentType.DIRECT, confidence=0.7)
+        cache.put("hello", original)
+        hit = cache.get("hello")
+        self.assertIsNotNone(hit)
+        self.assertIsNone(hit.thinking)

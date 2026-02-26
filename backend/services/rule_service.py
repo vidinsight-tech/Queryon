@@ -32,6 +32,7 @@ class RuleService:
         step_key: Optional[str] = None,
         required_step: Optional[str] = None,
         next_steps: Optional[Dict[str, Any]] = None,
+        conditions: Optional[Dict[str, Any]] = None,
     ) -> "OrchestratorRule":
         return await self._repo.create_rule(
             name=name,
@@ -45,6 +46,7 @@ class RuleService:
             step_key=step_key,
             required_step=required_step,
             next_steps=next_steps,
+            conditions=conditions,
         )
 
     async def delete(self, rule_id: UUID) -> bool:

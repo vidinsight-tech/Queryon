@@ -92,8 +92,159 @@ class TestOrchestratorResultShape(unittest.TestCase):
         self.assertEqual(r.answer, "ok")
         self.assertEqual(r.sources, [])
         self.assertIsNone(r.rule_matched)
+        self.assertIsNone(r.tool_called)
         self.assertFalse(r.fallback_used)
+        self.assertIsNone(r.fallback_from_intent)
         self.assertFalse(r.needs_clarification)
+
+    def test_fallback_fields_default_none(self) -> None:
+        """fallback_used=False and fallback_from_intent=None by default."""
+        r = OrchestratorResult(query="q", intent=IntentType.RAG)
+        self.assertFalse(r.fallback_used)
+        self.assertIsNone(r.fallback_from_intent)
+
+    def test_fallback_fields_can_be_set(self) -> None:
+        """Verify both fallback fields accept values."""
+        r = OrchestratorResult(
+            query="q",
+            intent=IntentType.DIRECT,
+            fallback_used=True,
+            fallback_from_intent="rag",
+        )
+        self.assertTrue(r.fallback_used)
+        self.assertEqual(r.fallback_from_intent, "rag")
+
+
+class TestOrchestratorFallbacks(unittest.TestCase):
+    """Verify rule→direct and rag→direct fallback paths set fallback_from_intent."""
+
+    def _make_orch(self, handlers: dict, *, config: "OrchestratorConfig" = None):
+        """Build a minimal Orchestrator with stubbed handlers."""
+        from backend.orchestrator.orchestrator import Orchestrator
+
+        class FakeLLM:
+            async def complete(self, prompt: str, *, model=None):
+                return '{"intent": "direct", "confidence": 0.9, "reasoning": "ok"}'
+
+        orch = Orchestrator(
+            llm=FakeLLM(),
+            config=config or OrchestratorConfig(
+                rules_first=False,
+                min_confidence=0.0,
+                enabled_intents=[IntentType.DIRECT, IntentType.RAG, IntentType.RULE],
+            ),
+        )
+        orch._handlers = handlers
+        return orch
+
+    def _make_handler(self, answer: str, intent: "IntentType"):
+        """Return a fake handler whose handle() resolves to an OrchestratorResult."""
+        result = OrchestratorResult(query="", intent=intent, answer=answer)
+
+        class FakeHandler:
+            async def handle(self, query, **kwargs):
+                return result
+
+        return FakeHandler()
+
+    def test_rule_to_direct_fallback(self) -> None:
+        """When RULE handler returns empty answer, fallback_from_intent='rule'."""
+        rule_handler = self._make_handler("", IntentType.RULE)
+        direct_handler = self._make_handler("Direct answer", IntentType.DIRECT)
+
+        orch = self._make_orch({
+            IntentType.RULE: rule_handler,
+            IntentType.DIRECT: direct_handler,
+        })
+
+        # Force RULE classification by providing a pre-classified result
+        from backend.orchestrator.types import ClassificationResult
+
+        async def _classify(*args, **kwargs):
+            return ClassificationResult(
+                intent=IntentType.RULE,
+                confidence=0.95,
+                reasoning="keyword match",
+                classifier_layer="pre",
+            )
+
+        orch._classify = _classify
+
+        result = asyncio.get_event_loop().run_until_complete(
+            orch.process("some query")
+        )
+
+        self.assertTrue(result.fallback_used)
+        self.assertEqual(result.fallback_from_intent, "rule")
+        self.assertEqual(result.intent, IntentType.DIRECT)
+        self.assertEqual(result.answer, "Direct answer")
+
+    def test_rag_to_direct_fallback(self) -> None:
+        """When RAG handler returns empty answer and fallback_to_direct=True,
+        fallback_from_intent='rag'."""
+        rag_handler = self._make_handler("", IntentType.RAG)
+        direct_handler = self._make_handler("Direct answer", IntentType.DIRECT)
+
+        config = OrchestratorConfig(
+            rules_first=False,
+            min_confidence=0.0,
+            fallback_to_direct=True,
+            enabled_intents=[IntentType.DIRECT, IntentType.RAG],
+        )
+        orch = self._make_orch(
+            {IntentType.RAG: rag_handler, IntentType.DIRECT: direct_handler},
+            config=config,
+        )
+
+        from backend.orchestrator.types import ClassificationResult
+
+        async def _classify(*args, **kwargs):
+            return ClassificationResult(
+                intent=IntentType.RAG,
+                confidence=0.9,
+                reasoning="RAG signal",
+                classifier_layer="pre",
+            )
+
+        orch._classify = _classify
+
+        result = asyncio.get_event_loop().run_until_complete(
+            orch.process("belgede ne yazıyor?")
+        )
+
+        self.assertTrue(result.fallback_used)
+        self.assertEqual(result.fallback_from_intent, "rag")
+        self.assertEqual(result.intent, IntentType.DIRECT)
+
+    def test_no_fallback_when_answer_present(self) -> None:
+        """When RULE handler returns an answer, no fallback should occur."""
+        rule_handler = self._make_handler("Rule answer", IntentType.RULE)
+        direct_handler = self._make_handler("Direct answer", IntentType.DIRECT)
+
+        orch = self._make_orch({
+            IntentType.RULE: rule_handler,
+            IntentType.DIRECT: direct_handler,
+        })
+
+        from backend.orchestrator.types import ClassificationResult
+
+        async def _classify(*args, **kwargs):
+            return ClassificationResult(
+                intent=IntentType.RULE,
+                confidence=0.95,
+                reasoning="match",
+                classifier_layer="pre",
+            )
+
+        orch._classify = _classify
+
+        result = asyncio.get_event_loop().run_until_complete(
+            orch.process("query")
+        )
+
+        self.assertFalse(result.fallback_used)
+        self.assertIsNone(result.fallback_from_intent)
+        self.assertEqual(result.answer, "Rule answer")
 
 
 class TestOrchestratorConfigPersistence(unittest.TestCase):

@@ -29,7 +29,9 @@ class PreClassifier:
         rag_signals: Optional[List[str]] = None,
         tool_triggers: Optional[Dict[str, List[str]]] = None,
     ) -> None:
-        self._rule_keywords = {kw.lower() for kw in rule_keywords}
+        # Skip very short keywords (< 4 chars) to avoid false-positive matches
+        # on common short words like "ad", "ya", "bu" appearing in unrelated queries.
+        self._rule_keywords = {kw.lower() for kw in rule_keywords if len(kw) >= 4}
         self._rag_signals = [s.lower() for s in (rag_signals or _DEFAULT_RAG_SIGNALS)]
         self._tool_triggers = {
             name: [t.lower() for t in triggers]

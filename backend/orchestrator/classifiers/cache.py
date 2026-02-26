@@ -20,7 +20,7 @@ class ClassificationCache:
         self._store: OrderedDict[str, tuple[ClassificationResult, float]] = OrderedDict()
 
     def get(self, query: str) -> Optional[ClassificationResult]:
-        key = query.strip().lower()
+        key = " ".join(query.split()).lower()
         entry = self._store.get(key)
         if entry is None:
             return None
@@ -35,10 +35,11 @@ class ClassificationCache:
             confidence=result.confidence,
             reasoning=result.reasoning,
             classifier_layer="cache",
+            thinking=result.thinking,
         )
 
     def put(self, query: str, result: ClassificationResult) -> None:
-        key = query.strip().lower()
+        key = " ".join(query.split()).lower()
         self._store[key] = (result, time.monotonic())
         self._store.move_to_end(key)
         while len(self._store) > self._max_size:

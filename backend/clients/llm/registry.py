@@ -32,5 +32,11 @@ class LLMRegistry:
         return builder(config)
 
 
-# Default registry; provider modules register themselves on import.
+# Default registry with all built-in providers pre-registered.
 default_registry = LLMRegistry()
+
+from backend.clients.llm.providers.openai import openai_builder  # noqa: E402
+from backend.clients.llm.providers.gemini import gemini_builder  # noqa: E402
+
+default_registry.register("openai", openai_builder)
+default_registry.register("gemini", gemini_builder)

@@ -15,6 +15,7 @@ from urllib.parse import urlparse, urlunparse
 from typing import TYPE_CHECKING, Optional
 
 import asyncpg
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -178,12 +179,45 @@ async def get_db(
             raise
 
 
+async def _migrate_db(conn: AsyncConnection) -> None:
+    """Add columns that were introduced after initial table creation.
+
+    Uses ADD COLUMN IF NOT EXISTS so repeated runs are safe.
+    This is intentionally simple DDL for dev/staging; use Alembic in production.
+    """
+    migrations = [
+        # orchestrator_rules: flow / conditions columns added after initial release
+        "ALTER TABLE orchestrator_rules ADD COLUMN IF NOT EXISTS flow_id VARCHAR(64)",
+        "ALTER TABLE orchestrator_rules ADD COLUMN IF NOT EXISTS step_key VARCHAR(64)",
+        "ALTER TABLE orchestrator_rules ADD COLUMN IF NOT EXISTS required_step VARCHAR(64)",
+        "ALTER TABLE orchestrator_rules ADD COLUMN IF NOT EXISTS next_steps JSONB",
+        "ALTER TABLE orchestrator_rules ADD COLUMN IF NOT EXISTS conditions JSONB",
+        # appointments: event_time added for slot-based booking
+        "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS event_time TEXT",
+        # appointments: human-readable reference number
+        "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS appt_number VARCHAR(20)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_appointments_appt_number ON appointments(appt_number)",
+        # conversations: platform-specific contact identity
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS contact_username VARCHAR(255)",
+        "CREATE INDEX IF NOT EXISTS ix_conversations_contact_username ON conversations(contact_username)",
+    ]
+    for stmt in migrations:
+        try:
+            await conn.execute(text(stmt))
+        except Exception as exc:
+            logger.warning("Migration statement skipped (%s): %s", exc.__class__.__name__, stmt)
+    logger.info("Database migration complete")
+
+
 async def init_db(
     config: Optional["PostgresConfig"] = None,
     *,
     drop_all: bool = False,
 ) -> None:
-    """Create all ORM tables. For dev/test only; use Alembic in production."""
+    """Create all ORM tables and run schema migrations.
+
+    For dev/test only; use Alembic in production.
+    """
     if config is None:
         from backend.config import load_postgres_config
         config = load_postgres_config()
@@ -194,6 +228,7 @@ async def init_db(
             await conn.run_sync(Base.metadata.drop_all)
         logger.info("Creating ORM tables")
         await conn.run_sync(Base.metadata.create_all)
+        await _migrate_db(conn)
     logger.info("Database initialised successfully")
 
 

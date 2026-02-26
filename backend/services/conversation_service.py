@@ -46,6 +46,7 @@ class ConversationService:
         contact_phone: Optional[str] = None,
         contact_email: Optional[str] = None,
         contact_name: Optional[str] = None,
+        contact_username: Optional[str] = None,
         contact_meta: Optional[Dict[str, Any]] = None,
         llm_id: Optional[UUID] = None,
         embedding_id: Optional[UUID] = None,
@@ -56,6 +57,7 @@ class ConversationService:
             contact_phone=contact_phone,
             contact_email=contact_email,
             contact_name=contact_name,
+            contact_username=contact_username,
             contact_meta=contact_meta,
             llm_id=llm_id,
             embedding_id=embedding_id,
@@ -86,6 +88,22 @@ class ConversationService:
         limit: int = 50,
     ) -> List["Conversation"]:
         return await self._conv_repo.list_active(platform=platform, limit=limit)
+
+    async def list_recent(
+        self,
+        *,
+        status: Optional[str] = None,
+        limit: int = 100,
+        skip: int = 0,
+    ) -> List["Conversation"]:
+        """Return conversations ordered by last activity, for the admin list view."""
+        return await self._conv_repo.list_recent(status=status, limit=limit, skip=skip)
+
+    async def get_active_by_channel(
+        self, platform: str, channel_id: str,
+    ) -> Optional["Conversation"]:
+        """Return the most recent active conversation for a platform+channel pair."""
+        return await self._conv_repo.get_active_by_channel(platform, channel_id)
 
     # ── Message recording ─────────────────────────────────────────
 
@@ -127,12 +145,15 @@ class ConversationService:
             confidence=confidence,
             classifier_layer=classifier_layer,
             rule_matched=result.rule_matched,
+            tool_called=result.tool_called,
             fallback_used=result.fallback_used,
             needs_clarification=result.needs_clarification,
             total_ms=metrics.total_ms if metrics else None,
             llm_calls_count=metrics.llm_calls_count if metrics else 0,
             sources=sources_data,
             extra_metadata=result.metadata if result.metadata else None,
+            thinking=classification.thinking if classification else None,
+            reasoning=classification.reasoning if classification else None,
         )
 
         events = self._build_events_from_result(result)
@@ -221,6 +242,7 @@ class ConversationService:
                     "confidence": classification.confidence,
                     "layer": classification.classifier_layer,
                     "reasoning": classification.reasoning,
+                    "thinking": classification.thinking,
                 },
             })
 
@@ -233,7 +255,10 @@ class ConversationService:
         if result.fallback_used:
             events.append({
                 "event_type": "fallback_triggered",
-                "data": {"from_intent": "rag", "to_intent": "direct"},
+                "data": {
+                    "from_intent": result.fallback_from_intent or "rag",
+                    "to_intent": "direct",
+                },
             })
 
         if result.needs_clarification:

@@ -96,25 +96,35 @@ class EmbeddingClassifier:
                 classifier_layer="embedding",
             )
 
-        q_vec = await self._embedder.embed_query(query)
+        try:
+            q_vec = await self._embedder.embed_query(query)
+        except Exception as exc:
+            logger.warning("EmbeddingClassifier: embed_query failed: %s", exc)
+            return ClassificationResult(
+                intent=IntentType.DIRECT,
+                confidence=0.0,
+                reasoning=f"embedding error: {exc}",
+                classifier_layer="embedding",
+            )
 
-        best_intent = IntentType.DIRECT
-        best_score = -1.0
-
+        # Compute mean cosine similarity per intent (more stable than global max)
+        intent_scores: Dict[IntentType, float] = {}
         for intent, proto_vecs in self._prototypes.items():
-            for pv in proto_vecs:
-                score = _cosine_similarity(q_vec, pv)
-                if score > best_score:
-                    best_score = score
-                    best_intent = intent
+            scores = [_cosine_similarity(q_vec, pv) for pv in proto_vecs]
+            intent_scores[intent] = sum(scores) / len(scores)
+
+        sorted_intents = sorted(intent_scores.items(), key=lambda x: x[1], reverse=True)
+        best_intent, best_score = sorted_intents[0]
+        second_score = sorted_intents[1][1] if len(sorted_intents) > 1 else 0.0
+        margin = best_score - second_score
 
         logger.debug(
-            "EmbeddingClassifier: query='%s' → %s (score=%.4f)",
-            query[:60], best_intent.value, best_score,
+            "EmbeddingClassifier: query='%s' → %s (mean=%.4f margin=%.4f)",
+            query[:60], best_intent.value, best_score, margin,
         )
         return ClassificationResult(
             intent=best_intent,
             confidence=round(best_score, 4),
-            reasoning=f"best cosine similarity: {best_score:.4f}",
+            reasoning=f"mean cosine similarity: {best_score:.4f}, margin: {margin:.4f}",
             classifier_layer="embedding",
         )

@@ -45,6 +45,7 @@ class RuleRepository(BaseRepository[OrchestratorRule]):
         step_key: Optional[str] = None,
         required_step: Optional[str] = None,
         next_steps: Optional[Dict[str, Any]] = None,
+        conditions: Optional[Dict[str, Any]] = None,
     ) -> OrchestratorRule:
         data: Dict[str, Any] = {
             "name": name,
@@ -63,6 +64,8 @@ class RuleRepository(BaseRepository[OrchestratorRule]):
             data["required_step"] = required_step
         if next_steps is not None:
             data["next_steps"] = next_steps
+        if conditions is not None:
+            data["conditions"] = conditions
         return await self.create(data)
 
     async def list_by_flow(

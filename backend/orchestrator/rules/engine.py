@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import time as dt_time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from backend.orchestrator.rules.models import OrchestratorRule
@@ -16,14 +17,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _LLM_RULE_MATCH_PROMPT = (
-    "You are a rule matcher. Given the user message and a list of rules, "
-    "determine which rule (if any) best matches the user's intent.\n\n"
-    "Rules:\n{rules}\n\n"
+    "You are a rule matcher. Think step-by-step about whether the user message "
+    "matches any of the listed rules.\n\n"
+    "Rules (id | name | description | example triggers):\n{rules}\n\n"
     "User message: \"{query}\"\n\n"
-    "If a rule matches, respond with ONLY the JSON: "
-    '{{\"rule_id\": \"<id>\", \"confidence\": 0.0-1.0}}\n'
-    "If no rule matches, respond with: "
-    '{{\"rule_id\": null, \"confidence\": 0.0}}'
+    "Think inside <thinking> tags (2-3 sentences):\n"
+    "- What is the user asking?\n"
+    "- Which rule's description and triggers best match?\n"
+    "- Is there a clear match, or does nothing fit?\n\n"
+    "Then output ONLY the JSON on a new line (no markdown):\n"
+    "<thinking>\n[your reasoning]\n</thinking>\n"
+    '{{\"rule_id\": \"<id or null>\", \"confidence\": 0.0-1.0}}'
 )
 
 _REGEX_PREFIX = "r:"
@@ -103,13 +107,17 @@ class RuleEngine:
 
     @property
     def keywords(self) -> set[str]:
-        """All plain-text (non-regex) trigger keywords, lowercased."""
+        """All plain-text (non-regex, non-AND) trigger keywords, lowercased.
+
+        AND patterns (``"word1 & word2"``) are intentionally excluded: adding
+        their individual parts would make the PreClassifier over-eager.
+        """
         kws: set[str] = set()
         for rule in self._rules:
             if not rule.is_active:
                 continue
             for pat in rule.trigger_patterns:
-                if not pat.startswith(_REGEX_PREFIX):
+                if not pat.startswith(_REGEX_PREFIX) and pat != _WILDCARD and "&" not in pat:
                     kws.add(pat.lower())
         return kws
 
@@ -120,6 +128,7 @@ class RuleEngine:
         query: str,
         *,
         flow_ctx: Optional[FlowContext] = None,
+        match_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[RuleMatchResult]:
         """Keyword/regex match — deterministic, no LLM call.
 
@@ -127,24 +136,41 @@ class RuleEngine:
         the current flow + step.  If nothing matches inside the flow, it also
         checks standalone (non-flow) rules so the user can still trigger
         global commands (e.g. "iptal" to cancel).
+
+        *match_context* is an optional dict passed from the caller that may
+        contain ``platform`` (str) and any other runtime values evaluated
+        against rule ``conditions``.
         """
         if flow_ctx and flow_ctx.active:
-            result = self._match_flow_entry_by_choice(query, flow_ctx)
+            result = self._match_flow_entry_by_choice(query, flow_ctx, match_context)
             if result is not None:
                 return result
-            result = self._match_flow_rules(query, flow_ctx)
+            result = self._match_flow_rules(query, flow_ctx, match_context)
             if result is not None:
                 return result
-            result = self._match_standalone_rules(query)
+            result = self._match_standalone_rules(query, match_context)
             if result is not None:
                 return result
             return None
 
-        result = self._match_standalone_rules(query)
+        result = self._match_standalone_rules(query, match_context)
         if result is not None:
             return result
-        result = self._match_flow_entry_rules(query)
+        result = self._match_flow_entry_rules(query, match_context)
         return result
+
+    def match_faq(
+        self,
+        query: str,
+        *,
+        match_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RuleMatchResult]:
+        """Match only standalone (non-flow) rules — used in character mode.
+
+        Skips all flow rules so the CharacterHandler gets every message that
+        isn't an exact FAQ keyword hit.
+        """
+        return self._match_standalone_rules(query, match_context)
 
     # ── LLM-assisted match (unchanged signature, flow-aware) ───────
 
@@ -156,9 +182,10 @@ class RuleEngine:
         confidence_threshold: float = 0.7,
         timeout_seconds: Optional[float] = None,
         flow_ctx: Optional[FlowContext] = None,
+        match_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[RuleMatchResult]:
         """Try keyword match first, then ask the LLM to pick a rule."""
-        result = self.match(query, flow_ctx=flow_ctx)
+        result = self.match(query, flow_ctx=flow_ctx, match_context=match_context)
         if result is not None:
             return result
 
@@ -167,7 +194,15 @@ class RuleEngine:
             return None
 
         rules_text = "\n".join(
-            f"- id={r.id} | name=\"{r.name}\" | description=\"{r.description}\""
+            "- id={id} | name=\"{name}\" | description=\"{desc}\"{triggers}".format(
+                id=r.id,
+                name=r.name,
+                desc=r.description,
+                triggers=(
+                    " | triggers: " + ", ".join(r.trigger_patterns[:5])
+                    if r.trigger_patterns else ""
+                ),
+            )
             for r in active
         )
         prompt = _LLM_RULE_MATCH_PROMPT.format(rules=rules_text, query=query)
@@ -176,7 +211,16 @@ class RuleEngine:
             if timeout_seconds is not None and timeout_seconds > 0:
                 coro = asyncio.wait_for(coro, timeout=timeout_seconds)
             raw = await coro
-            parsed = json.loads(raw.strip())
+            # Strip <thinking> block before parsing JSON
+            _m = re.search(r"</thinking>\s*", raw, re.DOTALL)
+            json_str = raw[_m.end():].strip() if _m else raw.strip()
+            # Strip markdown fences if present
+            if json_str.startswith("```"):
+                json_str = "\n".join(
+                    l for l in json_str.splitlines()
+                    if not l.strip().startswith("```")
+                ).strip()
+            parsed = json.loads(json_str)
             rule_id_str = parsed.get("rule_id")
             confidence = float(parsed.get("confidence", 0))
         except asyncio.TimeoutError:
@@ -194,29 +238,44 @@ class RuleEngine:
             logger.debug("RuleEngine: LLM returned unknown rule_id %s", rule_id_str)
             return None
 
+        if not self._check_conditions(matched, match_context):
+            logger.debug("RuleEngine: LLM-matched rule '%s' skipped (conditions not met)", matched.name)
+            return None
+
         logger.debug("RuleEngine: LLM matched rule '%s' (confidence=%.2f)", matched.name, confidence)
         return RuleMatchResult(
             rule=matched,
-            rendered_answer=self._render(matched),
+            rendered_answer=self._render(matched, flow_ctx),
             next_flow_context=self._build_next_ctx(matched, query),
         )
 
     # ── Internal matching helpers ──────────────────────────────────
 
-    def _match_standalone_rules(self, query: str) -> Optional[RuleMatchResult]:
+    def _match_standalone_rules(
+        self,
+        query: str,
+        match_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RuleMatchResult]:
         """Match against rules that are NOT part of any flow."""
         q_lower = query.lower()
         for rule in self._rules:
             if not rule.is_active or rule.is_flow_rule:
                 continue
-            if self._patterns_hit(rule, query, q_lower):
-                return RuleMatchResult(
-                    rule=rule,
-                    rendered_answer=self._render(rule),
-                )
+            if not self._patterns_hit(rule, query, q_lower):
+                continue
+            if not self._check_conditions(rule, match_context):
+                continue
+            return RuleMatchResult(
+                rule=rule,
+                rendered_answer=self._render(rule),
+            )
         return None
 
-    def _match_flow_entry_rules(self, query: str) -> Optional[RuleMatchResult]:
+    def _match_flow_entry_rules(
+        self,
+        query: str,
+        match_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RuleMatchResult]:
         """Match flow entry-point rules (flow_id set, required_step is NULL)."""
         q_lower = query.lower()
         for rule in self._rules:
@@ -224,16 +283,22 @@ class RuleEngine:
                 continue
             if rule.required_step is not None:
                 continue
-            if self._patterns_hit(rule, query, q_lower):
-                return RuleMatchResult(
-                    rule=rule,
-                    rendered_answer=self._render(rule),
-                    next_flow_context=self._build_next_ctx(rule, query),
-                )
+            if not self._patterns_hit(rule, query, q_lower):
+                continue
+            if not self._check_conditions(rule, match_context):
+                continue
+            return RuleMatchResult(
+                rule=rule,
+                rendered_answer=self._render(rule),
+                next_flow_context=self._build_next_ctx(rule, query),
+            )
         return None
 
     def _match_flow_rules(
-        self, query: str, flow_ctx: FlowContext,
+        self,
+        query: str,
+        flow_ctx: FlowContext,
+        match_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[RuleMatchResult]:
         """Match rules gated by the user's current flow + step."""
         q_lower = query.lower()
@@ -244,16 +309,22 @@ class RuleEngine:
                 continue
             if rule.required_step != flow_ctx.current_step:
                 continue
-            if self._patterns_hit(rule, query, q_lower):
-                return RuleMatchResult(
-                    rule=rule,
-                    rendered_answer=self._render(rule),
-                    next_flow_context=self._build_next_ctx(rule, query, flow_ctx),
-                )
+            if not self._patterns_hit(rule, query, q_lower):
+                continue
+            if not self._check_conditions(rule, match_context):
+                continue
+            return RuleMatchResult(
+                rule=rule,
+                rendered_answer=self._render(rule, flow_ctx),
+                next_flow_context=self._build_next_ctx(rule, query, flow_ctx),
+            )
         return None
 
     def _match_flow_entry_by_choice(
-        self, query: str, flow_ctx: FlowContext,
+        self,
+        query: str,
+        flow_ctx: FlowContext,
+        match_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[RuleMatchResult]:
         """When the user is inside a flow and the previous step had next_steps,
         resolve the choice to the next step's entry rule.
@@ -281,12 +352,12 @@ class RuleEngine:
                     continue
                 if self._choice_matches(choice, q_lower, q_words):
                     return self._resolve_choice_target(
-                        query, flow_ctx, parent, target_step,
+                        query, flow_ctx, parent, target_step, match_context,
                     )
 
             if wildcard_target is not None:
                 return self._resolve_choice_target(
-                    query, flow_ctx, parent, wildcard_target,
+                    query, flow_ctx, parent, wildcard_target, match_context,
                 )
         return None
 
@@ -311,12 +382,19 @@ class RuleEngine:
         flow_ctx: FlowContext,
         parent_rule: OrchestratorRule,
         target_step: str,
+        match_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[RuleMatchResult]:
         """Build a RuleMatchResult for a resolved choice transition."""
         target_rule = self._find_step_rule(
             flow_ctx.flow_id, target_step,  # type: ignore[arg-type]
         )
         if target_rule is None:
+            return None
+        if not self._check_conditions(target_rule, match_context):
+            logger.debug(
+                "RuleEngine: choice target rule '%s' skipped (conditions not met)",
+                target_rule.name,
+            )
             return None
 
         new_selections = {
@@ -331,9 +409,20 @@ class RuleEngine:
                 data={**flow_ctx.data, "last_query": query.strip()},
                 selections=new_selections,
             )
+        # Build a render context that includes the current choice so the target
+        # rule's template can reference {<current_step>} (e.g. {start}).
+        render_ctx = FlowContext(
+            flow_id=flow_ctx.flow_id,
+            current_step=target_step,
+            data={**flow_ctx.data, "last_query": query.strip()},
+            selections={
+                **flow_ctx.selections,
+                flow_ctx.current_step or "": query.strip(),
+            },
+        )
         return RuleMatchResult(
             rule=target_rule,
-            rendered_answer=self._render(target_rule),
+            rendered_answer=self._render(target_rule, render_ctx),
             next_flow_context=new_ctx,
         )
 
@@ -348,15 +437,81 @@ class RuleEngine:
                 return rule
         return None
 
+    @staticmethod
+    def _check_conditions(
+        rule: OrchestratorRule,
+        match_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return True if all conditions on the rule pass (or there are none).
+
+        Fails open (returns True) on malformed condition values so a
+        misconfiguration never silently breaks all rules.
+        """
+        conditions = getattr(rule, "conditions", None)
+        if not conditions:
+            return True
+
+        # ── platforms ─────────────────────────────────────────────
+        platforms = conditions.get("platforms")
+        if platforms:
+            req_platform = (match_context or {}).get("platform")
+            if req_platform is not None and req_platform not in platforms:
+                return False
+
+        # ── time_window ───────────────────────────────────────────
+        tw = conditions.get("time_window")
+        if tw:
+            try:
+                from datetime import datetime
+                tz_name = tw.get("timezone", "UTC")
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = None
+                now = datetime.now(tz=tz) if tz else datetime.utcnow()
+                current = now.time().replace(second=0, microsecond=0)
+
+                s_h, s_m = map(int, tw.get("start", "00:00").split(":"))
+                e_h, e_m = map(int, tw.get("end", "23:59").split(":"))
+                start = dt_time(s_h, s_m)
+                end = dt_time(e_h, e_m)
+
+                if start <= end:
+                    in_window = start <= current <= end
+                else:
+                    # overnight window e.g. 22:00–06:00
+                    in_window = current >= start or current <= end
+                if not in_window:
+                    return False
+            except Exception as exc:
+                logger.warning("RuleEngine: invalid time_window condition %s: %s", tw, exc)
+                # fail open
+
+        return True
+
     def _patterns_hit(
         self, rule: OrchestratorRule, query: str, q_lower: str,
     ) -> bool:
+        """Return True when at least one trigger pattern fires.
+
+        Pattern types
+        -------------
+        ``*``               — wildcard, always matches
+        ``r:<expr>``        — regex (case-insensitive)
+        ``word1 & word2``   — AND: every part must appear in the query
+        ``word``            — substring match (case-insensitive)
+        """
         for pat in rule.trigger_patterns:
             if pat == _WILDCARD:
                 return True
             if pat.startswith(_REGEX_PREFIX):
                 compiled = self._compiled.get(pat)
                 if compiled and compiled.search(query):
+                    return True
+            elif "&" in pat:
+                parts = [p.strip().lower() for p in pat.split("&") if p.strip()]
+                if parts and all(p in q_lower for p in parts):
                     return True
             else:
                 if pat.lower() in q_lower:
@@ -391,13 +546,27 @@ class RuleEngine:
     _SAFE_PLACEHOLDER = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
     @staticmethod
-    def _render(rule: OrchestratorRule) -> str:
+    def _render(
+        rule: OrchestratorRule,
+        flow_ctx: Optional[FlowContext] = None,
+    ) -> str:
         """Substitute variables into the response template.
 
-        Only placeholders matching {identifier} are replaced, using values from
-        *variables*. This avoids format-string injection (e.g. {0.__class__}).
+        Only placeholders matching ``{identifier}`` are replaced to prevent
+        format-string injection (e.g. ``{0.__class__}``).
+
+        Variable lookup order (later overrides earlier):
+        1. ``rule.variables`` — static values defined on the rule
+        2. ``flow_ctx.data`` — extra runtime data (e.g. ``last_query``)
+        3. ``flow_ctx.selections`` — user answers from each step, keyed by
+           step_key, so a template can reference ``{start}`` to get what the
+           user typed at the ``start`` step.
         """
-        variables = rule.variables or {}
+        variables: Dict[str, Any] = {**(rule.variables or {})}
+        if flow_ctx:
+            variables.update(flow_ctx.data)
+            variables.update(flow_ctx.selections)
+
         if not variables:
             return rule.response_template
 

@@ -37,3 +37,9 @@ class EmbeddingRegistry:
 
 
 default_registry = EmbeddingRegistry()
+
+from backend.clients.embedding.providers.openai import openai_builder  # noqa: E402
+from backend.clients.embedding.providers.gemini import gemini_builder  # noqa: E402
+
+default_registry.register("openai", openai_builder)
+default_registry.register("gemini", gemini_builder)

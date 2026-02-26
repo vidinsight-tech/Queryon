@@ -32,6 +32,8 @@ class Conversation(Base, TimestampMixin):
         Index("ix_conversations_channel_id", "channel_id"),
         Index("ix_conversations_contact_phone", "contact_phone"),
         Index("ix_conversations_last_message_at", "last_message_at"),
+        Index("ix_conversations_platform_channel_status", "platform", "channel_id", "status"),
+        Index("ix_conversations_contact_username", "contact_username"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -49,6 +51,8 @@ class Conversation(Base, TimestampMixin):
     contact_phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     contact_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    """Platform-specific user identity: Telegram @username, WhatsApp E.164 phone, Slack user ID."""
     contact_meta: Mapped[Optional[dict[str, Any]]] = mapped_column(
         JSONB, nullable=True,
     )
@@ -85,7 +89,7 @@ class Conversation(Base, TimestampMixin):
         back_populates="conversation",
         cascade="all, delete-orphan",
         order_by="Message.created_at",
-        lazy="selectin",
+        lazy="select",
     )
 
     def __repr__(self) -> str:
@@ -148,7 +152,7 @@ class Message(Base):
         back_populates="message",
         cascade="all, delete-orphan",
         order_by="MessageEvent.created_at",
-        lazy="selectin",
+        lazy="select",
     )
 
     def __repr__(self) -> str:

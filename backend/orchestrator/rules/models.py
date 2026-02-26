@@ -78,6 +78,22 @@ class OrchestratorRule(Base, TimestampMixin):
     Example: ``{"A": "danismanlik", "B": "egitim", "C": "destek"}``.
     NULL = flow ends after this rule."""
 
+    conditions: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True,
+    )
+    """Optional runtime conditions that must all pass for this rule to fire.
+
+    Supported keys:
+    - ``time_window``: ``{"start": "HH:MM", "end": "HH:MM", "timezone": "Europe/Istanbul"}``
+      Rule fires only when the current local time is within the window.
+      Overnight ranges (e.g. 22:00–06:00) are supported.
+    - ``platforms``: list of platform strings, e.g. ``["web", "whatsapp"]``.
+      Rule fires only when the request platform is in the list.
+      Platform is supplied via ``match_context`` at call time.
+
+    NULL = no conditions (always fires when patterns match).
+    """
+
     @property
     def is_flow_rule(self) -> bool:
         return self.flow_id is not None
